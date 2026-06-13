@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Scadenziario Commerciale Premium — VIDALOCA di Michela Vidale
-Versione 6.7 - Dashboard Avanzata, Bugfix Rubrica e Nuove Colonne
+Versione 6.8 - Dashboard Avanzata, Bugfix Rubrica, Filtri e Totali Dinamici
 """
 
 import tkinter as tk
@@ -50,12 +50,12 @@ C = {
     "ok_fg":       "#166534",  
     "red":         "#ef4444",  
     "green":       "#10b981",  
+    "aperti":      "#eff6ff",  # Aggiunto per nuovo filtro
+    "aperti_fg":   "#1e3a8a",  # Aggiunto per nuovo filtro
 }
 
 STATI_PASSIVO   = ["Da pagare", "Parziale", "Pagata", "Insoluta"]
 STATI_ATTIVO    = ["Da incassare", "Parziale", "Incassata", "Insoluta"]
-METODI_PAG      = ["Bonifico", "RID/SDD", "Contanti", "Assegno", "Carta", "Riba", "Altro"]
-TIPI_DOC        = ["Fattura", "Nota di credito", "Parcella", "Fattura differita", "Altro"]
 
 def get_conn():
     return sqlite3.connect(DB_FILE)
@@ -72,6 +72,18 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS config_condizioni (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT UNIQUE NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS config_metodi_pag (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT UNIQUE NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS config_tipi_doc (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome TEXT UNIQUE NOT NULL
             )
@@ -135,6 +147,16 @@ def init_db():
         if c.fetchone()[0] == 0:
             for cond in ["30 Giorni", "15 Giorni", "60 Giorni", "90 Giorni", "Vista fattura", "Contanti", "Riba 30 gg", "Riba 60 gg"]:
                 c.execute("INSERT OR IGNORE INTO config_condizioni (nome) VALUES (?)", (cond,))
+                
+        c.execute("SELECT COUNT(*) FROM config_metodi_pag")
+        if c.fetchone()[0] == 0:
+            for met in ["Bonifico", "RID/SDD", "Contanti", "Assegno", "Carta", "Riba", "Altro"]:
+                c.execute("INSERT OR IGNORE INTO config_metodi_pag (nome) VALUES (?)", (met,))
+
+        c.execute("SELECT COUNT(*) FROM config_tipi_doc")
+        if c.fetchone()[0] == 0:
+            for td in ["Fattura", "Nota di credito", "Parcella", "Fattura differita", "Altro"]:
+                c.execute("INSERT OR IGNORE INTO config_tipi_doc (nome) VALUES (?)", (td,))
 
 def get_condizioni_pagamento():
     try:
@@ -143,6 +165,22 @@ def get_condizioni_pagamento():
             if rows: return [r[0] for r in rows]
     except Exception: pass
     return ["30 Giorni", "15 Giorni", "60 Giorni", "90 Giorni", "Vista fattura", "Contanti", "Riba 30 gg", "Riba 60 gg"]
+
+def get_metodi_pagamento():
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT nome FROM config_metodi_pag ORDER BY id ASC").fetchall()
+            if rows: return [r[0] for r in rows]
+    except Exception: pass
+    return ["Bonifico", "Contanti", "Carta", "Altro"]
+
+def get_tipi_documento():
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT nome FROM config_tipi_doc ORDER BY id ASC").fetchall()
+            if rows: return [r[0] for r in rows]
+    except Exception: pass
+    return ["Fattura", "Nota di credito", "Altro"]
 
 def parse_date(val):
     if not val: return ""
@@ -307,76 +345,94 @@ class ImportoEntry(tk.Entry):
         if value is not None:
             self.insert(0, f"{float(value):.2f}".replace(".", ","))
 
-class ConfigCondizioniWindow(tk.Toplevel):
+# NUOVO PANNELLO IMPOSTAZIONI (Sostituisce ConfigCondizioniWindow)
+class ConfigImpostazioniWindow(tk.Toplevel):
     def __init__(self, master, on_close_callback=None):
         super().__init__(master)
-        self.title("Impostazioni Condizioni")
-        self.geometry("460x420")
+        self.title("Pannello Impostazioni")
+        self.geometry("500x460")
         self.resizable(False, False)
         self.configure(bg=C["surface"])
         self._on_close_callback = on_close_callback
         self._build()
-        self._load_condizioni()
         self.grab_set()
 
     def _build(self):
         hdr = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="Condizioni di Pagamento", font=("Segoe UI", 12, "bold"), bg=C["bg"], fg=C["text"]).pack(anchor="w")
+        tk.Label(hdr, text="Pannello Configurazioni Generali", font=("Segoe UI", 12, "bold"), bg=C["bg"], fg=C["text"]).pack(anchor="w")
         
-        main_fr = tk.Frame(self, bg=C["surface"], padx=16, pady=16)
-        main_fr.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         
-        input_fr = tk.Frame(main_fr, bg=C["surface"])
-        input_fr.pack(fill="x", pady=(0, 12))
+        tab_cond = tk.Frame(notebook, bg=C["surface"])
+        tab_metodi = tk.Frame(notebook, bg=C["surface"])
+        tab_tipi = tk.Frame(notebook, bg=C["surface"])
         
-        tk.Label(input_fr, text="Nuova stringa automatica (es. Riba 120 gg):", font=("Segoe UI", 9), bg=C["surface"], fg=C["muted"]).pack(anchor="w")
-        self.ent_cond = tk.Entry(input_fr, font=("Segoe UI", 10), relief="solid", bd=1)
-        self.ent_cond.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4, ipady=2)
+        notebook.add(tab_cond, text="Condizioni Pagamento")
+        notebook.add(tab_metodi, text="Metodi Pagamento")
+        notebook.add(tab_tipi, text="Tipi Documento")
         
-        tk.Button(input_fr, text="Aggiungi", command=self._add_condizione, bg=C["accent"], fg="white", font=("Segoe UI", 9, "bold"), relief="flat", padx=12).pack(side="right", ipady=2)
+        self._build_tab(tab_cond, "config_condizioni", "Nuova stringa automatica (es. Riba 120 gg):")
+        self._build_tab(tab_metodi, "config_metodi_pag", "Nuovo metodo pagamento (es. PayPal):")
+        self._build_tab(tab_tipi, "config_tipi_doc", "Nuovo tipo documento (es. Preventivo):")
         
-        list_fr = tk.Frame(main_fr, bg=C["surface"])
+        btn_fr = tk.Frame(self, bg=C["surface"], padx=16, pady=8)
+        btn_fr.pack(fill="x", side="bottom")
+        tk.Button(btn_fr, text="Chiudi e Aggiorna", command=self._chiudi, bg=C["border"], fg=C["text"], font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=4).pack(side="right")
+
+    def _build_tab(self, parent, table_name, label_text):
+        input_fr = tk.Frame(parent, bg=C["surface"], pady=12, padx=12)
+        input_fr.pack(fill="x")
+        
+        tk.Label(input_fr, text=label_text, font=("Segoe UI", 9), bg=C["surface"], fg=C["muted"]).pack(anchor="w")
+        ent = tk.Entry(input_fr, font=("Segoe UI", 10), relief="solid", bd=1)
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4, ipady=2)
+        
+        tree = ttk.Treeview(parent, columns=("Nome"), show="headings", height=8)
+        tree.heading("Nome", text="Valori in Elenco")
+        tree.column("Nome", width=300)
+        
+        def load_data():
+            for item in tree.get_children(): tree.delete(item)
+            with get_conn() as conn:
+                for r in conn.execute(f"SELECT nome FROM {table_name} ORDER BY id ASC").fetchall():
+                    tree.insert("", "end", values=r)
+                    
+        def add_data():
+            val = ent.get().strip()
+            if not val: return
+            try:
+                with get_conn() as conn: 
+                    conn.execute(f"INSERT INTO {table_name} (nome) VALUES (?)", (val,))
+                ent.delete(0, tk.END)
+                load_data()
+            except sqlite3.IntegrityError:
+                messagebox.showwarning("Attenzione", "Valore già esistente.")
+                
+        def del_data():
+            sel = tree.selection()
+            if not sel: return
+            val = tree.item(sel[0], "values")[0]
+            with get_conn() as conn: 
+                conn.execute(f"DELETE FROM {table_name} WHERE nome=?", (val,))
+            load_data()
+
+        tk.Button(input_fr, text="Aggiungi", command=add_data, bg=C["accent"], fg="white", font=("Segoe UI", 9, "bold"), relief="flat", padx=12).pack(side="right", ipady=2)
+        
+        list_fr = tk.Frame(parent, bg=C["surface"], padx=12)
         list_fr.pack(fill="both", expand=True)
         
-        self.tree = ttk.Treeview(list_fr, columns=("Nome"), show="headings", height=8)
-        self.tree.heading("Nome", text="Regole di dilazione registrate")
-        self.tree.column("Nome", width=300)
-        self.tree.pack(side="left", fill="both", expand=True)
-        
-        sb = ttk.Scrollbar(list_fr, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_fr, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         
-        btn_fr = tk.Frame(main_fr, bg=C["surface"])
-        btn_fr.pack(fill="x", pady=(14, 0))
-        tk.Button(btn_fr, text="Rimuovi Selezionata", command=self._delete_condizione, bg=C["scaduta"], fg=C["scaduta_fg"], font=("Segoe UI", 9, "bold"), relief="flat", padx=10, pady=4).pack(side="left")
-        tk.Button(btn_fr, text="Salva e Chiudi", command=self._chiudi, bg=C["border"], fg=C["text"], font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=4).pack(side="right")
-
-    def _load_condizioni(self):
-        for item in self.tree.get_children(): self.tree.delete(item)
-        with get_conn() as conn:
-            for r in conn.execute("SELECT nome FROM config_condizioni ORDER BY id ASC").fetchall():
-                self.tree.insert("", "end", values=r)
-
-    def _add_condizione(self):
-        nome = self.ent_cond.get().strip()
-        if not nome: return
-        try:
-            with get_conn() as conn:
-                conn.execute("INSERT INTO config_condizioni (nome) VALUES (?)", (nome,))
-            self.ent_cond.delete(0, tk.END)
-            self._load_condizioni()
-        except sqlite3.IntegrityError:
-            messagebox.showwarning("Attenzione", "Condizione già esistente.")
-
-    def _delete_condizione(self):
-        sel = self.tree.selection()
-        if not sel: return
-        nome = self.tree.item(sel[0], "values")[0]
-        with get_conn() as conn:
-            conn.execute("DELETE FROM config_condizioni WHERE nome=?", (nome,))
-        self._load_condizioni()
+        del_fr = tk.Frame(parent, bg=C["surface"], padx=12, pady=12)
+        del_fr.pack(fill="x")
+        tk.Button(del_fr, text="Rimuovi Selezionata", command=del_data, bg=C["scaduta"], fg=C["scaduta_fg"], font=("Segoe UI", 9, "bold"), relief="flat", padx=10, pady=4).pack(side="left")
+        
+        load_data()
 
     def _chiudi(self):
         if self._on_close_callback: self._on_close_callback()
@@ -453,7 +509,6 @@ class AziendeWindow(tk.Toplevel):
         cond = self.cmb_cond.get()
         if not doc: return
         
-        # Bugfix: Costrutto SELECT+UPDATE/INSERT standard per garantire massima retro-compatibilità con versioni vecchie di SQLite
         with get_conn() as conn:
             c = conn.cursor()
             c.execute("SELECT id FROM aziende WHERE nome=?", (doc,))
@@ -513,12 +568,12 @@ class FatturaForm(tk.Toplevel):
                 w.set(stati[0])
                 w.bind("<<ComboboxSelected>>", self._on_stato_changed)
             elif key == "metodo": 
-                w = ttk.Combobox(fr, values=METODI_PAG, width=22)
+                w = ttk.Combobox(fr, values=get_metodi_pagamento(), width=22) # Dinamico
             elif key == "tipo_doc":
-                w = ttk.Combobox(fr, values=TIPI_DOC, width=22, state="readonly")
-                w.set("Fattura")
+                tipi = get_tipi_documento()
+                w = ttk.Combobox(fr, values=tipi, width=22, state="readonly") # Dinamico
+                if tipi: w.set(tipi[0])
             elif key == "anagrafica":
-                # Recupero fornitori/clienti dal database
                 with get_conn() as conn:
                     aziende = [r[0] for r in conn.execute("SELECT nome FROM aziende ORDER BY nome ASC").fetchall()]
                 w = ttk.Combobox(fr, values=aziende, width=22)
@@ -527,10 +582,27 @@ class FatturaForm(tk.Toplevel):
             w.grid(row=i, column=1, sticky="w", pady=4, ipady=1 if key not in ("data_doc","data_scad","data_pag","stato","metodo","tipo_doc") else 0)
             self._widgets[key] = w
 
+        # Aggiunta Binding per Auto-allineamento "Vista fattura" / "Contanti"
+        self._widgets["anagrafica"].bind("<<ComboboxSelected>>", self._check_align_vista_fattura)
+        self._widgets["anagrafica"].bind("<FocusOut>", self._check_align_vista_fattura)
+        self._widgets["data_doc"]._entry.bind("<FocusOut>", lambda e: [self._widgets["data_doc"]._on_focus_out(), self._check_align_vista_fattura()])
+
         bf = tk.Frame(self, bg=C["surface"], padx=20, pady=14)
         bf.pack(fill="x")
         tk.Button(bf, text="Salva Scheda", command=self._save, font=("Segoe UI", 9, "bold"), bg=C["accent"], fg="white", relief="flat", padx=16, pady=6).pack(side="right")
         tk.Button(bf, text="Esci", command=self.destroy, font=("Segoe UI", 9, "bold"), bg=C["border"], fg=C["text"], relief="flat", padx=16, pady=6).pack(side="right", padx=4)
+
+    def _check_align_vista_fattura(self, event=None):
+        ana = self._widgets["anagrafica"].get().strip()
+        dd = self._widgets["data_doc"].get()
+        if ana and dd:
+            with get_conn() as conn:
+                res = conn.execute("SELECT condizioni FROM aziende WHERE nome=?", (ana,)).fetchone()
+                if res:
+                    cond = res[0].lower()
+                    if "vista fattura" in cond or "contanti" in cond:
+                        self._widgets["data_scad"].set(dd)
+                        self._widgets["data_pag"].set(dd)
 
     def _on_stato_changed(self, event=None):
         stato_sel = self._widgets["stato"].get()
@@ -634,9 +706,7 @@ class ImportWindow(tk.Toplevel):
                 ana = str(rec.get("Fornitore", rec.get("Cliente", "")) or "").strip()
                 if not num or not ana: continue
                 
-                # --- LOGICA AGGIUNTA: Auto-inserimento in rubrica ---
                 c.execute("INSERT OR IGNORE INTO aziende (nome, condizioni) VALUES (?, ?)", (ana, "30 Giorni"))
-                # ----------------------------------------------------
                 
                 if c.execute("SELECT id FROM fatture WHERE numero=? AND anagrafica=? AND tipo=?", (num, ana, t)).fetchone():
                     sal += 1; continue
@@ -662,9 +732,7 @@ class ImportWindow(tk.Toplevel):
                     ana = str(rec.get("Fornitore", rec.get("Cliente", "")) or "").strip()
                     if not num or not ana: continue
                     
-                    # --- LOGICA AGGIUNTA: Auto-inserimento in rubrica ---
                     c.execute("INSERT OR IGNORE INTO aziende (nome, condizioni) VALUES (?, ?)", (ana, "30 Giorni"))
-                    # ----------------------------------------------------
                     
                     if c.execute("SELECT id FROM fatture WHERE numero=? AND anagrafica=? AND tipo=?", (num, ana, t)).fetchone():
                         sal += 1; continue
@@ -749,6 +817,13 @@ class App(tk.Tk):
         self._view = "dashboard" 
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._load_data())
+        
+        # Filtri Date Aggiuntivi
+        self._search_da = tk.StringVar()
+        self._search_da.trace_add("write", lambda *_: self._load_data())
+        self._search_a = tk.StringVar()
+        self._search_a.trace_add("write", lambda *_: self._load_data())
+
         self._sort_col, self._sort_rev = "data_scad", False
         self._current_tag_filter = "tutti"  
         
@@ -825,7 +900,7 @@ class App(tk.Tk):
         
         tk.Button(sb, text="🏢   Rubrica Aziende", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: AziendeWindow(self)).pack(fill="x", padx=8)
         tk.Button(sb, text="📥   Import Gestionale", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: ImportWindow(self, self._refresh_current_view)).pack(fill="x", padx=8)
-        tk.Button(sb, text="⚙️   Impostazioni", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: ConfigCondizioniWindow(self, on_close_callback=self._refresh_current_view)).pack(fill="x", padx=8)
+        tk.Button(sb, text="⚙️   Impostazioni", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: ConfigImpostazioniWindow(self, on_close_callback=self._refresh_current_view)).pack(fill="x", padx=8)
 
         spacer = tk.Frame(sb, bg=C["text"])
         spacer.pack(fill="both", expand=True)
@@ -847,8 +922,15 @@ class App(tk.Tk):
         search_fr = tk.Frame(tb, bg="white", bd=1, relief="solid", highlightthickness=0)
         search_fr.pack(side="left", ipady=2)
         search_fr.config(highlightbackground=C["border"])
-        tk.Label(search_fr, text="  🔍  ", bg="white", fg=C["muted"]).pack(side="left")
-        tk.Entry(search_fr, textvariable=self._search_var, font=("Segoe UI", 10), bg="white", relief="flat", bd=0, width=28).pack(side="left", padx=4)
+        
+        tk.Label(search_fr, text="  🔍 Cerca Nome/Note: ", bg="white", fg=C["muted"]).pack(side="left")
+        tk.Entry(search_fr, textvariable=self._search_var, font=("Segoe UI", 10), bg="white", relief="flat", bd=0, width=20).pack(side="left", padx=4)
+        
+        tk.Label(search_fr, text=" | Da (AAAA-MM-DD): ", bg="white", fg=C["muted"]).pack(side="left")
+        tk.Entry(search_fr, textvariable=self._search_da, font=("Segoe UI", 10), bg="white", relief="flat", bd=0, width=11).pack(side="left", padx=4)
+        
+        tk.Label(search_fr, text=" | A (AAAA-MM-DD): ", bg="white", fg=C["muted"]).pack(side="left")
+        tk.Entry(search_fr, textvariable=self._search_a, font=("Segoe UI", 10), bg="white", relief="flat", bd=0, width=11).pack(side="left", padx=4)
         
         tk.Button(tb, text="💥  Elimina", command=self._delete_invoice, bg=C["surface"], fg=C["red"], font=("Segoe UI", 9, "bold"), relief="solid", borderwidth=1, padx=14, pady=5).pack(side="right", padx=3)
         tk.Button(tb, text="✏️  Modifica", command=self._edit_invoice, bg=C["surface"], fg=C["text"], font=("Segoe UI", 9, "bold"), relief="solid", borderwidth=1, padx=14, pady=5).pack(side="right", padx=3)
@@ -889,16 +971,32 @@ class App(tk.Tk):
         self.tree.tag_configure("scaduta", background=C["scaduta"], foreground=C["scaduta_fg"])
         self.tree.tag_configure("urgente", background=C["urgente"], foreground=C["urgente_fg"])
         self.tree.tag_configure("ok", background=C["ok"], foreground=C["ok_fg"])
+        self.tree.tag_configure("aperti", background=C["aperti"], foreground=C["aperti_fg"])
         self.tree.bind("<Double-1>", lambda _: self._edit_invoice())
 
+        # Area dei totali misti dinamici (Sotto la tabella)
+        self.tot_dyn_fr = tk.Frame(self.table_frame, bg=C["surface"], bd=1, relief="solid")
+        self.tot_dyn_fr.pack(fill="x", padx=24, pady=(0, 8))
+        
+        tk.Label(self.tot_dyn_fr, text="📊 TOTALI DELLA VISTA CORRENTE (FILTRATI):", font=("Segoe UI", 9), bg=C["surface"], fg=C["muted"]).pack(side="left", padx=16, pady=6)
+        self.lbl_dyn_lordo = tk.Label(self.tot_dyn_fr, text="Tot. Lordo: 0,00 €", font=("Segoe UI", 10, "bold"), bg=C["surface"], fg=C["text"])
+        self.lbl_dyn_lordo.pack(side="left", padx=16, pady=6)
+        self.lbl_dyn_pagato = tk.Label(self.tot_dyn_fr, text="Tot. Pagato: 0,00 €", font=("Segoe UI", 10, "bold"), bg=C["surface"], fg=C["green"])
+        self.lbl_dyn_pagato.pack(side="left", padx=16, pady=6)
+        self.lbl_dyn_residuo = tk.Label(self.tot_dyn_fr, text="Residuo Aperto: 0,00 €", font=("Segoe UI", 10, "bold"), bg=C["surface"], fg=C["red"])
+        self.lbl_dyn_residuo.pack(side="left", padx=16, pady=6)
+
+        # Legenda con Filtri Tag
         leg = tk.Frame(self.table_frame, bg=C["bg"])
-        leg.pack(fill="x", padx=24, pady=10)
+        leg.pack(fill="x", padx=24, pady=(4, 10))
         tk.Label(leg, text="Filtra tabella per stato: ", font=("Segoe UI", 9, "italic"), bg=C["bg"], fg=C["muted"]).pack(side="left", padx=(0, 4))
         
         self.btn_f_scaduto = tk.Button(leg, text="  Scaduto  ", font=("Segoe UI", 8, "bold"), bg=C["scaduta"], fg=C["scaduta_fg"], bd=1, relief="solid", cursor="hand2", command=lambda: self._set_tag_filter("scaduta"))
         self.btn_f_scaduto.pack(side="left", padx=3)
         self.btn_f_urgente = tk.Button(leg, text="  In scadenza (7gg)  ", font=("Segoe UI", 8, "bold"), bg=C["urgente"], fg=C["urgente_fg"], bd=1, relief="solid", cursor="hand2", command=lambda: self._set_tag_filter("urgente"))
         self.btn_f_urgente.pack(side="left", padx=3)
+        self.btn_f_aperti = tk.Button(leg, text="  Da Pagare / Aperti  ", font=("Segoe UI", 8, "bold"), bg=C["aperti"], fg=C["aperti_fg"], bd=1, relief="solid", cursor="hand2", command=lambda: self._set_tag_filter("aperti"))
+        self.btn_f_aperti.pack(side="left", padx=3)
         self.btn_f_ok = tk.Button(leg, text="  Chiuso / Saldato  ", font=("Segoe UI", 8, "bold"), bg=C["ok"], fg=C["ok_fg"], bd=1, relief="solid", cursor="hand2", command=lambda: self._set_tag_filter("ok"))
         self.btn_f_ok.pack(side="left", padx=3)
         self.btn_f_tutti = tk.Button(leg, text="  ❌ Mostra Tutti  ", font=("Segoe UI", 8, "bold"), bg=C["surface"], fg=C["text"], bd=1, relief="solid", cursor="hand2", command=lambda: self._set_tag_filter("tutti"))
@@ -1328,7 +1426,7 @@ class App(tk.Tk):
 
     def _set_tag_filter(self, tag_name):
         self._current_tag_filter = tag_name
-        for b, name in [(self.btn_f_scaduto, "scaduta"), (self.btn_f_urgente, "urgente"), (self.btn_f_ok, "ok"), (self.btn_f_tutti, "tutti")]:
+        for b, name in [(self.btn_f_scaduto, "scaduta"), (self.btn_f_urgente, "urgente"), (self.btn_f_aperti, "aperti"), (self.btn_f_ok, "ok"), (self.btn_f_tutti, "tutti")]:
             if name == tag_name: b.config(relief="sunken", borderwidth=2)
             else: b.config(relief="solid", borderwidth=1)
         self._load_data()
@@ -1354,7 +1452,7 @@ class App(tk.Tk):
             self.dashboard_frame.pack_forget()
             self.corrispettivi_frame.pack_forget()
             self.table_frame.pack(fill="both", expand=True)
-            for b in (self.btn_f_scaduto, self.btn_f_urgente, self.btn_f_ok): b.config(relief="solid", borderwidth=1)
+            for b in (self.btn_f_scaduto, self.btn_f_urgente, self.btn_f_aperti, self.btn_f_ok): b.config(relief="solid", borderwidth=1)
             self.btn_f_tutti.config(relief="sunken", borderwidth=2)
             self._load_data()
 
@@ -1548,29 +1646,71 @@ class App(tk.Tk):
         if self._view in ("passivo", "attivo"): query += " AND tipo = ?"; params.append(self._view)
         search = self._search_var.get().strip()
         if search: query += " AND (numero LIKE ? OR anagrafica LIKE ? OR note LIKE ?)"; lk = f"%{search}%"; params.extend([lk, lk, lk])
+        
+        # Gestione dei nuovi filtri date
+        da = self._search_da.get().strip()
+        a = self._search_a.get().strip()
+        if da: query += " AND data_doc >= ?"; params.append(da)
+        if a: query += " AND data_doc <= ?"; params.append(a)
+
         if self._sort_col: query += f" ORDER BY {self._sort_col} {"DESC" if self._sort_rev else "ASC"}"
             
         with get_conn() as conn: rows = conn.execute(query, params).fetchall()
             
         kpi_dovuto = kpi_scaduto = kpi_saldate = 0.0
+        dyn_lordo = dyn_pagato = dyn_residuo = 0.0 # Per la striscia dei totali misti
+        
         today_s, limit_u = date.today().strftime("%Y-%m-%d"), (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
         
         for r in rows:
             fid, tipo, numero, anagrafica, data_doc, data_scad, data_pag, importo, pagato, stato, metodo, tipo_doc, note = r
             residuo = max(0.0, importo - pagato)
+            
+            # Calcolo stato/tag visivo
+            if stato in ("Pagata", "Incassata"):
+                tag = "ok"
+            elif data_scad and data_scad < today_s:
+                tag = "scaduta"
+            elif data_scad and data_scad <= limit_u:
+                tag = "urgente"
+            else:
+                tag = "aperti"
+            
+            # Applica filtro status visuale dalla legenda
+            if self._current_tag_filter != "tutti":
+                if self._current_tag_filter == "aperti":
+                    # Il filtro "aperti" mostra tutto tranne i saldati (Pagata/Incassata)
+                    if stato in ("Pagata", "Incassata"): continue
+                elif tag != self._current_tag_filter:
+                    if self._current_tag_filter == "ok" and tag != "ok": continue
+                    elif self._current_tag_filter == "scaduta" and tag != "scaduta": continue
+                    elif self._current_tag_filter == "urgente" and tag != "urgente": continue
+
+            # Se arriva qua, significa che la riga viene stampata (inserita nella tabella)
             if tipo_doc != "Nota di credito":
                 kpi_dovuto += residuo
                 if stato in ("Pagata", "Incassata"): kpi_saldate += 1
                 elif data_scad and data_scad < today_s: kpi_scaduto += residuo
-            tag = "ok" if stato in ("Pagata", "Incassata") else ("scaduta" if data_scad and data_scad < today_s else ("urgente" if data_scad and data_scad <= limit_u else ""))
-            if self._current_tag_filter != "tutti" and tag != self._current_tag_filter: continue
+
+            # Somma i contatori dinamici basati esclusivamente su quello che sta per essere inserito a schermo
+            dyn_lordo += importo
+            dyn_pagato += pagato
+            dyn_residuo += residuo
+
             self.tree.insert("", "end", values=(fid, tipo.upper(), numero, anagrafica, tipo_doc, fmt_date(data_doc), fmt_date(data_scad), fmt_date(data_pag), fmt_num(importo), fmt_num(pagato), fmt_num(residuo), metodo, stato, note), tags=(tag,))
-        self._render_table_kpis(kpi_dovuto, kpi_scaduto, len(rows), int(kpi_saldate))
+        
+        # Renderizza KPI originali in alto
+        self._render_table_kpis(kpi_dovuto, kpi_scaduto, len(self.tree.get_children()), int(kpi_saldate))
+        
+        # Aggiorna la striscia dei totali dinamici in basso in tempo reale
+        self.lbl_dyn_lordo.config(text=f"Tot. Lordo: {fmt_num(dyn_lordo)} €")
+        self.lbl_dyn_pagato.config(text=f"Tot. Pagato: {fmt_num(dyn_pagato)} €")
+        self.lbl_dyn_residuo.config(text=f"Residuo Aperto: {fmt_num(dyn_residuo)} €")
 
     def _render_table_kpis(self, dovuto, scaduto, totali, saldate):
         for w in self._kpi_frame.winfo_children(): w.destroy()
         lbl_txt = "Volume Aperto" if self._view == "tutte" else ("Esposizione Fornitori" if self._view == "passivo" else "Massa Incassi Attesa")
-        kpis = [("Elementi In Elenco", str(totali), C["muted"]), (lbl_txt, f"{fmt_num(dovuto)} €", C["teal_accent"]), ("Di cui Scaduto Effettivo ⚠️", f"{fmt_num(scaduto)} €", C["scaduta_fg"] if scaduto > 0 else C["muted"]), ("Partite Saldate", str(saldate), C["green"])]
+        kpis = [("Elementi Filtrati", str(totali), C["muted"]), (lbl_txt, f"{fmt_num(dovuto)} €", C["teal_accent"]), ("Di cui Scaduto Effettivo ⚠️", f"{fmt_num(scaduto)} €", C["scaduta_fg"] if scaduto > 0 else C["muted"]), ("Partite Saldate", str(saldate), C["green"])]
         for title, val, color in kpis:
             f = tk.Frame(self._kpi_frame, bg="white", bd=1, relief="solid", padx=14, pady=10)
             f.pack(side="left", expand=True, fill="x", padx=4)
@@ -1596,8 +1736,6 @@ class App(tk.Tk):
         if f and messagebox.askyesno("Conferma", "Eliminare la riga selezionata?"):
             with get_conn() as conn: conn.execute("DELETE FROM pagamenti WHERE fattura_id=?", (f[0],)); conn.execute("DELETE FROM fatture WHERE id=?", (f[0],))
             self._load_data()
-
-
 if __name__ == "__main__":
     app = App()
     app.mainloop()
