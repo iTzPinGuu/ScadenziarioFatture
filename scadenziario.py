@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Scadenziario Commerciale Premium — VIDALOCA di Michela Vidale
-Versione 6.8 - Dashboard Avanzata, Bugfix Rubrica, Filtri e Totali Dinamici
+Versione 7.0 - Inserimento massivo (ricorrenti ed elenchi) + Annulla operazioni, Pulizia importazioni
 """
 
 import tkinter as tk
@@ -16,6 +16,8 @@ import io
 from datetime import datetime, date, timedelta
 import calendar
 import re
+import json
+import shutil
 
 try:
     from PIL import Image, ImageTk
@@ -59,6 +61,78 @@ STATI_ATTIVO    = ["Da incassare", "Parziale", "Incassata", "Insoluta"]
 
 def get_conn():
     return sqlite3.connect(DB_FILE)
+
+# ─── PUNTI DI RIPRISTINO ("TORNA INDIETRO") ──────────────────────────────────
+# Prima di ogni operazione che modifica i dati viene salvata una copia del database
+# nella cartella _undo accanto al file .db. Si mantengono le ultime UNDO_MAX copie.
+UNDO_DIR = os.path.join(os.path.dirname(DB_FILE), "_undo_scadenziario")
+UNDO_MAX = 40
+
+def crea_snapshot(etichetta, kind="op"):
+    """Copia il database com'è adesso. Restituisce il percorso, o None se fallisce."""
+    try:
+        os.makedirs(UNDO_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        path = os.path.join(UNDO_DIR, f"snap_{ts}.db")
+        src = sqlite3.connect(DB_FILE)
+        dst = sqlite3.connect(path)
+        try: src.backup(dst)
+        finally:
+            dst.close(); src.close()
+        with open(path + ".json", "w", encoding="utf-8") as f:
+            json.dump({"label": etichetta, "kind": kind, "when": datetime.now().isoformat(timespec="seconds")}, f, ensure_ascii=False)
+        for p, _, _, _ in elenco_snapshot()[UNDO_MAX:]:
+            _elimina_snapshot(p)
+        return path
+    except Exception:
+        return None
+
+def elenco_snapshot():
+    """Lista (percorso, quando, etichetta, kind), dal più recente al più vecchio."""
+    out = []
+    if not os.path.isdir(UNDO_DIR): return out
+    for fn in sorted(os.listdir(UNDO_DIR), reverse=True):
+        if not (fn.startswith("snap_") and fn.endswith(".db")): continue
+        p = os.path.join(UNDO_DIR, fn)
+        label, kind, when = "Operazione", "op", ""
+        try:
+            with open(p + ".json", encoding="utf-8") as f:
+                m = json.load(f)
+            label, kind, when = m.get("label", label), m.get("kind", kind), m.get("when", "")
+        except Exception: pass
+        try: dt = datetime.fromisoformat(when)
+        except Exception: dt = datetime.fromtimestamp(os.path.getmtime(p))
+        out.append((p, dt, label, kind))
+    return out
+
+def _elimina_snapshot(path):
+    for q in (path, path + ".json"):
+        try: os.remove(q)
+        except OSError: pass
+
+def punto_di_ripristino(parent, etichetta):
+    """Crea lo snapshot; se non riesce chiede se continuare senza rete di sicurezza."""
+    if crea_snapshot(etichetta): return True
+    return messagebox.askyesno("Attenzione",
+        "Non riesco a creare il punto di ripristino (annulla operazione NON disponibile per questa azione).\n\nContinuare comunque?",
+        parent=parent)
+
+def ripristina_snapshot(path):
+    """Riporta il database allo stato dello snapshot. Lo stato attuale viene salvato come 'redo'."""
+    snaps = elenco_snapshot()
+    target = next((x for x in snaps if x[0] == path), None)
+    if not target: raise FileNotFoundError("Punto di ripristino non trovato.")
+    if not crea_snapshot(f"Prima di tornare a: {target[2]}", kind="redo"):
+        raise RuntimeError("Impossibile salvare lo stato attuale prima del ripristino.")
+    src = sqlite3.connect(path)
+    dst = sqlite3.connect(DB_FILE)
+    try: src.backup(dst)
+    finally:
+        dst.close(); src.close()
+    # il punto usato e quelli più recenti (operazioni "future") non servono più
+    for p, dt, _, kind in snaps:
+        if kind == "op" and dt >= target[1]: _elimina_snapshot(p)
+    init_db()
 
 def init_db():
     with get_conn() as conn:
@@ -110,6 +184,11 @@ def init_db():
         # Aggiornamento schema per database esistenti senza la colonna data_pag
         try:
             c.execute("ALTER TABLE fatture ADD COLUMN data_pag TEXT")
+        except Exception:
+            pass
+        # Identificativo del lotto di importazione (per poter eliminare un import intero)
+        try:
+            c.execute("ALTER TABLE fatture ADD COLUMN import_id TEXT")
         except Exception:
             pass
             
@@ -508,6 +587,7 @@ class AziendeWindow(tk.Toplevel):
         doc = self.ent_nome.get().strip()
         cond = self.cmb_cond.get()
         if not doc: return
+        if not punto_di_ripristino(self, f"Rubrica: salvato {doc}"): return
         
         with get_conn() as conn:
             c = conn.cursor()
@@ -525,6 +605,7 @@ class AziendeWindow(tk.Toplevel):
         if not sel: return
         nome = self.tree.item(sel[0], "values")[0]
         if messagebox.askyesno("Conferma", f"Rimuovere '{nome}' dalla rubrica?"):
+            if not punto_di_ripristino(self, f"Rubrica: rimossa {nome}"): return
             with get_conn() as conn:
                 conn.execute("DELETE FROM aziende WHERE nome=?", (nome,))
             self._load_aziende()
@@ -628,6 +709,7 @@ class FatturaForm(tk.Toplevel):
         num = self._widgets["numero"].get().strip()
         ana = self._widgets["anagrafica"].get().strip()
         if not num or not ana: return
+        if not punto_di_ripristino(self, f"{'Modifica' if self._fattura else 'Nuovo documento'} {num} - {ana}"): return
         
         with get_conn() as conn:
             c = conn.cursor()
@@ -651,6 +733,7 @@ class ImportWindow(tk.Toplevel):
         self.geometry("450x260")
         self.resizable(False, False)
         self._on_done = on_done
+        self._batch = None
         self.configure(bg=C["surface"])
         self._build()
         self.grab_set()
@@ -684,6 +767,13 @@ class ImportWindow(tk.Toplevel):
         if not path or not os.path.exists(path): return
         t = "passivo" if "passivo" in self._tipo.get() else "attivo"
         ext = os.path.splitext(path)[1].lower()
+        reg = "PASSIVO (fornitori)" if t == "passivo" else "ATTIVO (clienti)"
+        if not messagebox.askyesno("Conferma importazione",
+                f"Importare il file\n{os.path.basename(path)}\n\nnel registro {reg}?\n\n"
+                "Prima dell'import viene salvato un punto di ripristino: potrai annullare tutto con «Annulla ultima operazione».", parent=self):
+            return
+        if not punto_di_ripristino(self, f"Importazione {os.path.basename(path)} ({t})"): return
+        self._batch = datetime.now().strftime("%Y%m%d-%H%M%S") + "_" + os.path.basename(path)
         try:
             ins, sal = self._process_xlsx(path, t) if ext in (".xlsx", ".xls") else self._process_csv(path, t)
             self._log.config(text=f"Import completato. Inseriti: {ins} | Saltati: {sal}")
@@ -716,8 +806,8 @@ class ImportWindow(tk.Toplevel):
                 td = str(rec.get("Tipo documento") or "Fattura").strip()
                 if "differita" in td.lower(): td = "Fattura differita"
                 st = mappa_stato_fte(rec.get("Stato FTE"), t)
-                c.execute("INSERT INTO fatture (tipo,numero,anagrafica,data_doc,data_scad,importo,pagato,stato,tipo_doc) VALUES (?,?,?,?,?,?,?,?,?)",
-                          (t, num, ana, dd, ds, imp, 0.0, st, td))
+                c.execute("INSERT INTO fatture (tipo,numero,anagrafica,data_doc,data_scad,importo,pagato,stato,tipo_doc,import_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                          (t, num, ana, dd, ds, imp, 0.0, st, td, self._batch))
                 ins += 1
         return ins, sal
 
@@ -742,10 +832,565 @@ class ImportWindow(tk.Toplevel):
                     td = str(rec.get("Tipo documento") or "Fattura").strip()
                     if "differita" in td.lower(): td = "Fattura differita"
                     st = mappa_stato_fte(rec.get("Stato FTE"), t)
-                    c.execute("INSERT INTO fatture (tipo,numero,anagrafica,data_doc,data_scad,importo,pagato,stato,tipo_doc) VALUES (?,?,?,?,?,?,?,?,?)",
-                              (t, num, ana, dd, ds, imp, 0.0, st, td))
+                    c.execute("INSERT INTO fatture (tipo,numero,anagrafica,data_doc,data_scad,importo,pagato,stato,tipo_doc,import_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                              (t, num, ana, dd, ds, imp, 0.0, st, td, self._batch))
                     ins += 1
         return ins, sal
+
+class CronologiaWindow(tk.Toplevel):
+    """Elenco dei punti di ripristino: permette di tornare a prima di una qualsiasi operazione."""
+    def __init__(self, master, on_done=None):
+        super().__init__(master)
+        self.title("Cronologia operazioni — Torna indietro")
+        self.geometry("720x460")
+        self.configure(bg=C["surface"])
+        self._on_done = on_done
+        hdr = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Torna a com'era PRIMA di una operazione", fg=C["text"], bg=C["bg"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(hdr, text="Le voci «Prima di tornare a…» servono per rifare ciò che hai annullato.", fg=C["muted"], bg=C["bg"], font=("Segoe UI", 9)).pack(anchor="w")
+        fr = tk.Frame(self, bg=C["surface"], padx=16, pady=8)
+        fr.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(fr, columns=("quando", "op"), show="headings", selectmode="browse")
+        self.tree.heading("quando", text="Data e ora"); self.tree.heading("op", text="Operazione")
+        self.tree.column("quando", width=150, anchor="w"); self.tree.column("op", width=500, anchor="w")
+        sb = ttk.Scrollbar(fr, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+        bf = tk.Frame(self, bg=C["surface"], padx=16, pady=10)
+        bf.pack(fill="x")
+        tk.Button(bf, text="↩️  Torna a prima di questa operazione", command=self._ripristina, bg=C["accent"], fg="white",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=6).pack(side="right")
+        tk.Button(bf, text="Chiudi", command=self.destroy, bg=C["border"], fg=C["text"], font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=6).pack(side="right", padx=6)
+        self._paths = {}
+        for p, dt, label, kind in elenco_snapshot():
+            iid = self.tree.insert("", "end", values=(dt.strftime("%d/%m/%Y %H:%M:%S"), label))
+            self._paths[iid] = (p, label)
+        self.grab_set()
+
+    def _ripristina(self):
+        sel = self.tree.selection()
+        if not sel: return
+        p, label = self._paths[sel[0]]
+        if not messagebox.askyesno("Conferma", f"Riportare il database a PRIMA di:\n\n«{label}»\n\n"
+                "Tutte le modifiche fatte da quel momento in poi (da chiunque) verranno annullate.\n"
+                "Lo stato attuale viene comunque salvato, quindi potrai tornare avanti.", parent=self): return
+        try: ripristina_snapshot(p)
+        except Exception as e:
+            messagebox.showerror("Errore", str(e), parent=self); return
+        messagebox.showinfo("Fatto", "Database ripristinato.", parent=self)
+        if self._on_done: self._on_done()
+        self.destroy()
+
+class PulisciImportazioniWindow(tk.Toplevel):
+    """Per eliminare in blocco documenti inseriti per errore (es. import sbagliato)."""
+    def __init__(self, master, on_done=None):
+        super().__init__(master)
+        self.title("Pulizia importazioni — elimina documenti in blocco")
+        self.geometry("1000x640")
+        self.configure(bg=C["surface"])
+        self._on_done = on_done
+        hdr = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="1) Scegli il gruppo di inserimento   2) Seleziona le righe da eliminare   3) Elimina",
+                 fg=C["text"], bg=C["bg"], font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(hdr, text="I gruppi sono raggruppati per giorno di inserimento e registro. L'operazione si può annullare da «Annulla ultima operazione».",
+                 fg=C["muted"], bg=C["bg"], font=("Segoe UI", 9)).pack(anchor="w")
+
+        top = tk.Frame(self, bg=C["surface"], padx=16, pady=6); top.pack(fill="x")
+        gc = ("giorno", "reg", "n", "tot", "lotto")
+        self.tg = ttk.Treeview(top, columns=gc, show="headings", height=6, selectmode="browse")
+        for c_, t_, w_ in (("giorno", "Inserite il", 100), ("reg", "Registro", 90), ("n", "N. documenti", 100), ("tot", "Totale €", 120), ("lotto", "File importato", 450)):
+            self.tg.heading(c_, text=t_); self.tg.column(c_, width=w_, anchor="w")
+        self.tg.pack(fill="x"); self.tg.bind("<<TreeviewSelect>>", self._load_rows)
+
+        mid = tk.Frame(self, bg=C["surface"], padx=16, pady=6); mid.pack(fill="both", expand=True)
+        rc = ("id", "numero", "anagrafica", "data_doc", "importo", "pagato", "stato")
+        self.tr = ttk.Treeview(mid, columns=rc, show="headings", selectmode="extended")
+        for c_, t_, w_ in (("id", "ID", 60), ("numero", "Numero", 110), ("anagrafica", "Azienda", 320), ("data_doc", "Data", 90), ("importo", "Importo", 100), ("pagato", "Pagato", 90), ("stato", "Stato", 110)):
+            self.tr.heading(c_, text=t_); self.tr.column(c_, width=w_, anchor="w")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tr.yview)
+        self.tr.configure(yscrollcommand=sb.set)
+        self.tr.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+
+        bf = tk.Frame(self, bg=C["surface"], padx=16, pady=10); bf.pack(fill="x")
+        self.lbl = tk.Label(bf, text="", bg=C["surface"], fg=C["muted"], font=("Segoe UI", 9, "bold")); self.lbl.pack(side="left")
+        tk.Button(bf, text="💥  Elimina selezionate", command=self._elimina, bg=C["red"], fg="white", font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=6).pack(side="right")
+        tk.Button(bf, text="Seleziona tutte", command=lambda: self.tr.selection_set(self.tr.get_children()), bg=C["border"], fg=C["text"],
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=6).pack(side="right", padx=6)
+        tk.Button(bf, text="Chiudi", command=self.destroy, bg=C["border"], fg=C["text"], font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=6).pack(side="right")
+        self._groups = {}
+        self._load_groups()
+        self.grab_set()
+
+    def _load_groups(self):
+        for i in self.tg.get_children(): self.tg.delete(i)
+        self._groups.clear()
+        with get_conn() as conn:
+            rows = conn.execute("""SELECT COALESCE(data_ins,''), tipo, COALESCE(import_id,''), COUNT(*), COALESCE(SUM(importo),0)
+                                   FROM fatture GROUP BY 1,2,3 ORDER BY 1 DESC, 3 DESC""").fetchall()
+        for d, t, imp, n, tot in rows:
+            iid = self.tg.insert("", "end", values=(fmt_date(d), t, n, fmt_num(tot), imp.split("_", 1)[-1] if imp else "(inserimento manuale / import precedente)"))
+            self._groups[iid] = (d, t, imp)
+
+    def _load_rows(self, e=None):
+        for i in self.tr.get_children(): self.tr.delete(i)
+        sel = self.tg.selection()
+        if not sel: return
+        d, t, imp = self._groups[sel[0]]
+        with get_conn() as conn:
+            rows = conn.execute("""SELECT id, numero, anagrafica, data_doc, importo, pagato, stato FROM fatture
+                                   WHERE COALESCE(data_ins,'')=? AND tipo=? AND COALESCE(import_id,'')=? ORDER BY id""", (d, t, imp)).fetchall()
+        for r in rows:
+            self.tr.insert("", "end", iid=str(r[0]), values=(r[0], r[1], r[2], fmt_date(r[3]), fmt_num(r[4]), fmt_num(r[5]), r[6]))
+        self.lbl.config(text=f"{len(rows)} documenti nel gruppo")
+
+    def _elimina(self):
+        ids = [int(i) for i in self.tr.selection()]
+        if not ids: return
+        con_pag = sum(1 for i in ids if float(str(self.tr.set(str(i), "pagato")).replace(".", "").replace(",", ".") or 0) > 0)
+        msg = f"Eliminare definitivamente {len(ids)} documenti?"
+        if con_pag: msg += f"\n\nATTENZIONE: {con_pag} di questi hanno già dei pagamenti registrati."
+        if not messagebox.askyesno("Conferma eliminazione", msg, parent=self): return
+        if not punto_di_ripristino(self, f"Pulizia: eliminati {len(ids)} documenti"): return
+        with get_conn() as conn:
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k+500]; q = ",".join("?" * len(chunk))
+                conn.execute(f"DELETE FROM pagamenti WHERE fattura_id IN ({q})", chunk)
+                conn.execute(f"DELETE FROM fatture WHERE id IN ({q})", chunk)
+        messagebox.showinfo("Fatto", f"Eliminati {len(ids)} documenti.", parent=self)
+        self._load_groups(); self._load_rows()
+        if self._on_done: self._on_done()
+
+# ─── INSERIMENTO MASSIVO: DOCUMENTI RICORRENTI (affitto, rate) ED ELENCHI (buste paga) ───
+# La logica "pura" sta nelle funzioni qui sotto; la finestra (InserimentoMassivoWindow)
+# mostra solo un'anteprima modificabile. Nel database si scrive SOLO premendo «Crea».
+MESI_IT = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+           "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
+
+def aggiungi_mesi(d, n):
+    """Sposta la data d di n mesi. Se il giorno non esiste (es. 31 → febbraio) usa l'ultimo del mese."""
+    m = d.month - 1 + n
+    anno, mese = d.year + m // 12, m % 12 + 1
+    return date(anno, mese, min(d.day, calendar.monthrange(anno, mese)[1]))
+
+def giorno_fisso_dal(d, giorno):
+    """Primo 'giorno N del mese' (es. il 5) che cade nella data d o dopo."""
+    def _in_mese(anno, mese):
+        return date(anno, mese, min(giorno, calendar.monthrange(anno, mese)[1]))
+    cand = _in_mese(d.year, d.month)
+    if cand >= d: return cand
+    succ = aggiungi_mesi(date(d.year, d.month, 1), 1)
+    return _in_mese(succ.year, succ.month)
+
+def formatta_numero(pattern, d, n):
+    """Segnaposto: {mm} mese 01-12 · {mese} nome del mese · {aaaa} anno · {aa} anno a 2 cifre · {n} progressivo."""
+    return (pattern.replace("{mm}", f"{d.month:02d}").replace("{mese}", MESI_IT[d.month - 1])
+                   .replace("{aaaa}", str(d.year)).replace("{aa}", f"{d.year % 100:02d}")
+                   .replace("{n}", str(n)))
+
+def data_da_testo(s):
+    """'' → ''; data valida (GG/MM/AAAA, GG-MM-AAAA, GG.MM.AAAA, AAAA-MM-GG) → 'AAAA-MM-GG'; altrimenti None."""
+    s = (s or "").strip()
+    if not s: return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+        try: return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError: continue
+    return None
+
+def importo_da_testo(s):
+    """Come parse_importo, ma '1.250' (punto delle migliaia, senza decimali) vale 1250 e non 1,25."""
+    s = str(s or "").replace("€", "").replace("\u00a0", "").replace(" ", "").strip()
+    if re.fullmatch(r"-?\d{1,3}(\.\d{3})+", s): s = s.replace(".", "")
+    return parse_importo(s)
+
+def parse_elenco_incollato(testo):
+    """Una riga per voce: 'Nome <TAB> Importo [<TAB> Note]' (copiato da Excel), oppure separato da ';',
+    oppure 'Nome 1.250,00'. Restituisce (voci[(nome, importo, nota)], righe_scartate)."""
+    voci, scartate = [], []
+    for riga in (testo or "").splitlines():
+        riga = riga.strip()
+        if not riga: continue
+        if "\t" in riga: parti = [p.strip() for p in riga.split("\t")]
+        elif ";" in riga: parti = [p.strip() for p in riga.split(";")]
+        else:
+            m = re.match(r"^(.*\S)\s+(-?[\d.,]+)\s*€?$", riga)
+            parti = [m.group(1), m.group(2)] if m else [riga]
+        nome = parti[0]
+        imp = importo_da_testo(parti[1]) if len(parti) > 1 else 0.0
+        nota = parti[2] if len(parti) > 2 else ""
+        if not nome or imp <= 0:
+            scartate.append(riga); continue
+        voci.append((nome, imp, nota))
+    return voci, scartate
+
+def scadenza_massiva(c, anagrafica, d_doc, giorno_fisso=None):
+    """Giorno fisso del mese se indicato, altrimenti le condizioni di pagamento della Rubrica."""
+    if giorno_fisso: return giorno_fisso_dal(d_doc, giorno_fisso).strftime("%Y-%m-%d")
+    return calcola_scadenza_automatico(c, anagrafica, d_doc.strftime("%Y-%m-%d"))
+
+def genera_righe_ricorrenti(c, anagrafica, importo, data_inizio, n_mesi, pattern, giorno_fisso=None, note=""):
+    """Stesso importo e stessa azienda per n_mesi mesi consecutivi a partire da data_inizio."""
+    righe = []
+    for k in range(n_mesi):
+        d = aggiungi_mesi(data_inizio, k)
+        righe.append({"numero": formatta_numero(pattern, d, k + 1), "anagrafica": anagrafica,
+                      "data_doc": d.strftime("%Y-%m-%d"), "data_scad": scadenza_massiva(c, anagrafica, d, giorno_fisso),
+                      "importo": importo, "note": note})
+    return righe
+
+def genera_righe_elenco(c, voci, d_doc, scad_iso, pattern):
+    """Un documento per ogni voce dell'elenco, tutti con la stessa data documento."""
+    righe = []
+    for k, (nome, importo, nota) in enumerate(voci):
+        righe.append({"numero": formatta_numero(pattern, d_doc, k + 1), "anagrafica": nome,
+                      "data_doc": d_doc.strftime("%Y-%m-%d"),
+                      "data_scad": scad_iso or scadenza_massiva(c, nome, d_doc),
+                      "importo": importo, "note": nota})
+    return righe
+
+def controlla_riga_massiva(c, r, tipo, gia_viste):
+    """Restituisce '' se la riga è inseribile, altrimenti il motivo per cui verrebbe saltata.
+    Stesso criterio anti-doppione dell'import: numero + ragione sociale + registro."""
+    numero, ana = r["numero"].strip(), r["anagrafica"].strip()
+    if not numero or not ana: return "dati mancanti"
+    if not r["data_doc"]: return "data mancante"
+    if not r["data_scad"]: return "scadenza mancante"
+    if r["importo"] <= 0: return "importo mancante"
+    chiave = (numero, ana, tipo)
+    if chiave in gia_viste: return "doppione nell'anteprima"
+    if c.execute("SELECT 1 FROM fatture WHERE numero=? AND anagrafica=? AND tipo=?", chiave).fetchone(): return "già presente"
+    gia_viste.add(chiave)
+    return ""
+
+def inserisci_documenti_massivi(righe, tipo, tipo_doc, metodo, saldate_passate=False, aggiungi_rubrica=False, etichetta="Inserimento massivo"):
+    """Scrive nel database le righe valide (tutto o niente). Restituisce (inseriti, saltati).
+    L'import_id permette di ritrovarle/eliminarle da «Pulisci importazioni»."""
+    batch = datetime.now().strftime("%Y%m%d-%H%M%S") + "_" + etichetta
+    oggi = date.today().strftime("%Y-%m-%d")
+    ins = sal = 0
+    viste = set()
+    with get_conn() as conn:
+        c = conn.cursor()
+        for r in righe:
+            if controlla_riga_massiva(c, r, tipo, viste):
+                sal += 1; continue
+            if saldate_passate and r["data_scad"] < oggi:
+                stato, pagato, d_pag = ("Pagata" if tipo == "passivo" else "Incassata"), r["importo"], r["data_scad"]
+            else:
+                stato, pagato, d_pag = ("Da pagare" if tipo == "passivo" else "Da incassare"), 0.0, None
+            if aggiungi_rubrica:
+                c.execute("INSERT OR IGNORE INTO aziende (nome, condizioni) VALUES (?, ?)", (r["anagrafica"].strip(), "30 Giorni"))
+            c.execute("""INSERT INTO fatture (tipo, numero, anagrafica, data_doc, data_scad, data_pag, importo, pagato, stato, metodo, tipo_doc, note, import_id)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (tipo, r["numero"].strip(), r["anagrafica"].strip(), r["data_doc"], r["data_scad"], d_pag,
+                       r["importo"], pagato, stato, metodo, tipo_doc, r["note"].strip(), batch))
+            ins += 1
+    return ins, sal
+
+class InserimentoMassivoWindow(tk.Toplevel):
+    """Crea molti documenti in una volta: ricorrenti (affitto, rate, abbonamenti) oppure elenchi (buste paga).
+    Tutto passa da un'anteprima modificabile (doppio clic su una cella): nel database si scrive solo con «Crea»."""
+    COLS = ("numero", "anagrafica", "data_doc", "data_scad", "importo", "note", "esito")
+
+    def __init__(self, master, on_done=None):
+        super().__init__(master)
+        self.title("Inserimento massivo — documenti ricorrenti ed elenchi")
+        self.geometry("1040x800")
+        self.configure(bg=C["surface"])
+        self._on_done = on_done
+        self._rows, self._editor, self._n_ok = [], None, 0
+        self._build()
+        self._refresh_grid()
+        self.grab_set()
+
+    # ── piccoli helper grafici ──
+    def _label(self, parent, text):
+        return tk.Label(parent, text=text, font=("Segoe UI", 9), bg=C["surface"], fg=C["muted"])
+
+    def _entry(self, parent, width, text=""):
+        e = tk.Entry(parent, font=("Segoe UI", 10), relief="solid", bd=1, width=width)
+        if text: e.insert(0, text)
+        return e
+
+    def _avviso(self, msg):
+        messagebox.showwarning("Inserimento massivo", msg, parent=self)
+
+    def _tipo(self):
+        return "passivo" if self._reg.get().startswith("passivo") else "attivo"
+
+    # ── costruzione finestra ──
+    def _build(self):
+        hdr = tk.Frame(self, bg=C["bg"], padx=16, pady=12); hdr.pack(fill="x")
+        tk.Label(hdr, text="Inserimento massivo di documenti", fg=C["text"], bg=C["bg"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(hdr, text="1) Dati comuni   2) Genera l'anteprima   3) Controlla / correggi le celle   4) Crea.   Finché non premi «Crea» non viene scritto nulla.",
+                 fg=C["muted"], bg=C["bg"], font=("Segoe UI", 9)).pack(anchor="w")
+
+        # Dati comuni a tutti i documenti
+        com = tk.Frame(self, bg=C["surface"], padx=16, pady=8); com.pack(fill="x")
+        self._reg = tk.StringVar(value="passivo (fornitori)")
+        self._label(com, "Registro").grid(row=0, column=0, sticky="w")
+        cb = ttk.Combobox(com, textvariable=self._reg, values=["passivo (fornitori)", "attivo (clienti)"], width=20, state="readonly")
+        cb.grid(row=0, column=1, sticky="w", padx=(6, 18))
+        cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_grid())
+        self._label(com, "Tipo documento").grid(row=0, column=2, sticky="w")
+        tipi = get_tipi_documento()
+        self.cmb_tipo_doc = ttk.Combobox(com, values=tipi, width=18, state="readonly")
+        if tipi: self.cmb_tipo_doc.set(tipi[0])
+        self.cmb_tipo_doc.grid(row=0, column=3, sticky="w", padx=(6, 18))
+        self._label(com, "Canale").grid(row=0, column=4, sticky="w")
+        metodi = get_metodi_pagamento()
+        self.cmb_metodo = ttk.Combobox(com, values=metodi, width=16)
+        if metodi: self.cmb_metodo.set(metodi[0])
+        self.cmb_metodo.grid(row=0, column=5, sticky="w", padx=6)
+        self._v_saldate = tk.BooleanVar(value=False)
+        self._v_rubrica = tk.BooleanVar(value=False)
+        tk.Checkbutton(com, text="Segna come già saldate le scadenze già passate (fino a oggi)", variable=self._v_saldate,
+                       bg=C["surface"], fg=C["text"], activebackground=C["surface"], font=("Segoe UI", 9)).grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        tk.Checkbutton(com, text="Aggiungi le ragioni sociali nuove alla Rubrica Aziende (con scadenza 30 giorni)", variable=self._v_rubrica,
+                       bg=C["surface"], fg=C["text"], activebackground=C["surface"], font=("Segoe UI", 9)).grid(row=2, column=0, columnspan=6, sticky="w")
+
+        # Due modi di generare l'anteprima
+        nb = ttk.Notebook(self); nb.pack(fill="x", padx=16, pady=(4, 6))
+        t1 = tk.Frame(nb, bg=C["surface"], padx=14, pady=10)
+        t2 = tk.Frame(nb, bg=C["surface"], padx=14, pady=10)
+        nb.add(t1, text="  🔁  Ricorrente (affitto, rate, abbonamenti)  ")
+        nb.add(t2, text="  📋  Elenco (buste paga, più voci)  ")
+
+        # — Tab 1: ricorrente —
+        with get_conn() as conn:
+            aziende = [r[0] for r in conn.execute("SELECT nome FROM aziende ORDER BY nome ASC").fetchall()]
+        self._label(t1, "Ragione Sociale").grid(row=0, column=0, sticky="w", pady=4)
+        self.cmb_ana = ttk.Combobox(t1, values=aziende, width=34)
+        self.cmb_ana.grid(row=0, column=1, sticky="w", padx=(6, 24))
+        self._label(t1, "Importo €").grid(row=0, column=2, sticky="w")
+        self.ent_imp = ImportoEntry(t1, width=12)
+        self.ent_imp.grid(row=0, column=3, sticky="w", padx=6, ipady=1)
+
+        self._label(t1, "Primo documento").grid(row=1, column=0, sticky="w", pady=4)
+        self.de_inizio = DateEntry(t1)
+        self.de_inizio.grid(row=1, column=1, sticky="w", padx=(6, 24))
+        self.de_inizio.set(aggiungi_mesi(date.today().replace(day=1), 1).strftime("%Y-%m-%d"))
+        self._label(t1, "Numero di mesi").grid(row=1, column=2, sticky="w")
+        self.spn_mesi = ttk.Spinbox(t1, from_=1, to=120, width=6)
+        self.spn_mesi.grid(row=1, column=3, sticky="w", padx=6)
+        self.spn_mesi.set(12)
+
+        self._label(t1, "Numero documento").grid(row=2, column=0, sticky="w", pady=4)
+        self.ent_pat1 = self._entry(t1, 36, "Affitto {mm}/{aaaa}")
+        self.ent_pat1.grid(row=2, column=1, sticky="w", padx=(6, 24), ipady=1)
+        self._label(t1, "Scadenza il giorno").grid(row=2, column=2, sticky="w")
+        self.spn_giorno = ttk.Spinbox(t1, from_=1, to=31, width=6)
+        self.spn_giorno.grid(row=2, column=3, sticky="w", padx=6)
+        self.spn_giorno.set("")
+        self._label(t1, "(vuoto = come da Rubrica)").grid(row=2, column=4, sticky="w")
+
+        self._label(t1, "Note").grid(row=3, column=0, sticky="w", pady=4)
+        self.ent_note1 = self._entry(t1, 36)
+        self.ent_note1.grid(row=3, column=1, sticky="w", padx=(6, 24), ipady=1)
+        self._label(t1, "Segnaposto nel numero:  {mm} mese 01-12  ·  {mese} nome del mese  ·  {aaaa} anno  ·  {aa} anno breve  ·  {n} progressivo").grid(row=4, column=0, columnspan=5, sticky="w", pady=(2, 8))
+        tk.Button(t1, text="⬇  Genera anteprima ricorrente", command=self._genera_ricorrente, bg=C["accent"], fg="white",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=16, pady=6).grid(row=5, column=0, columnspan=2, sticky="w")
+
+        # — Tab 2: elenco —
+        self._label(t2, "Data documento").grid(row=0, column=0, sticky="w", pady=4)
+        self.de_doc = DateEntry(t2)
+        self.de_doc.grid(row=0, column=1, sticky="w", padx=(6, 24))
+        self.de_doc.set(date.today().strftime("%Y-%m-%d"))
+        self._label(t2, "Scadenza").grid(row=0, column=2, sticky="w")
+        self.de_scad = DateEntry(t2)
+        self.de_scad.grid(row=0, column=3, sticky="w", padx=6)
+        self._label(t2, "(vuota = come da Rubrica)").grid(row=0, column=4, sticky="w")
+
+        self._label(t2, "Numero documento").grid(row=1, column=0, sticky="w", pady=4)
+        self.ent_pat2 = self._entry(t2, 36, "Busta paga {mm}/{aaaa}")
+        self.ent_pat2.grid(row=1, column=1, sticky="w", padx=(6, 24), ipady=1)
+
+        self._label(t2, "Elenco: una riga per voce →  Nome ⇥ Importo  (puoi incollare direttamente da Excel).  Terza colonna facoltativa = note.").grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 2))
+        self.txt = tk.Text(t2, height=6, width=110, font=("Segoe UI", 10), relief="solid", bd=1, undo=True)
+        self.txt.grid(row=3, column=0, columnspan=5, sticky="w")
+        self.txt.bind("<Control-z>", self._undo_testo)  # evita che Ctrl+Z richiami «Annulla ultima operazione» dell'app
+        tk.Button(t2, text="⬇  Genera anteprima da elenco", command=self._genera_elenco, bg=C["accent"], fg="white",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=16, pady=6).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        # Anteprima modificabile
+        pv = tk.Frame(self, bg=C["surface"], padx=16); pv.pack(fill="x")
+        tk.Label(pv, text="ANTEPRIMA  (doppio clic su una cella per correggerla)", font=("Segoe UI", 9, "bold"), bg=C["surface"], fg=C["text"]).pack(side="left")
+        self._lbl_info = tk.Label(pv, text="", font=("Segoe UI", 9), bg=C["surface"], fg=C["muted"])
+        self._lbl_info.pack(side="right")
+
+        mid = tk.Frame(self, bg=C["surface"], padx=16, pady=4); mid.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(mid, columns=self.COLS, show="headings", selectmode="extended")
+        for key, txt, w, anc in (("numero", "N. Documento", 160, "w"), ("anagrafica", "Ragione Sociale", 260, "w"), ("data_doc", "Data Doc.", 90, "center"),
+                                 ("data_scad", "Scadenza", 90, "center"), ("importo", "Importo €", 100, "e"), ("note", "Note", 160, "w"), ("esito", "Controllo", 140, "w")):
+            self.tree.heading(key, text=txt); self.tree.column(key, width=w, anchor=anc)
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+        self.tree.tag_configure("ok", background=C["surface"], foreground=C["text"])
+        self.tree.tag_configure("ko", background=C["scaduta"], foreground=C["scaduta_fg"])
+        self.tree.bind("<Double-1>", self._on_dblclick)
+
+        bf = tk.Frame(self, bg=C["surface"], padx=16, pady=10); bf.pack(fill="x")
+        self._lbl_tot = tk.Label(bf, text="", font=("Segoe UI", 10, "bold"), bg=C["surface"], fg=C["text"])
+        self._lbl_tot.pack(side="left")
+        self.btn_crea = tk.Button(bf, text="✅  Crea documenti", command=self._crea, bg=C["green"], fg="white",
+                                  font=("Segoe UI", 9, "bold"), relief="flat", padx=16, pady=6)
+        self.btn_crea.pack(side="right")
+        tk.Button(bf, text="Chiudi", command=self.destroy, bg=C["border"], fg=C["text"], font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=6).pack(side="right", padx=6)
+        tk.Button(bf, text="Svuota anteprima", command=self._svuota, bg=C["border"], fg=C["text"], font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=6).pack(side="right", padx=6)
+        tk.Button(bf, text="🗑  Rimuovi selezionate", command=self._rimuovi, bg=C["scaduta"], fg=C["scaduta_fg"], font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=6).pack(side="right", padx=6)
+
+    def _undo_testo(self, event=None):
+        try: self.txt.edit_undo()
+        except tk.TclError: pass
+        return "break"
+
+    # ── generazione anteprima ──
+    def _genera_ricorrente(self):
+        ana = self.cmb_ana.get().strip()
+        imp = importo_da_testo(self.ent_imp.get())
+        d0 = data_da_testo(self.de_inizio.get())
+        pattern = self.ent_pat1.get().strip()
+        if not ana: return self._avviso("Indica la Ragione Sociale.")
+        if imp <= 0: return self._avviso("Indica un importo maggiore di zero.")
+        if not d0: return self._avviso("Indica una data del primo documento valida (GG/MM/AAAA).")
+        try: n_mesi = int(str(self.spn_mesi.get()).strip())
+        except ValueError: n_mesi = 0
+        if not 1 <= n_mesi <= 120: return self._avviso("Il numero di mesi deve essere tra 1 e 120.")
+        if not pattern: return self._avviso("Indica il numero documento (es. Affitto {mm}/{aaaa}).")
+        if n_mesi > 1 and "{" not in pattern:
+            return self._avviso("Il numero documento deve contenere almeno un segnaposto (es. {mm}/{aaaa}), "
+                                "altrimenti tutti i documenti avrebbero lo stesso numero.")
+        giorno = None
+        g_txt = str(self.spn_giorno.get()).strip()
+        if g_txt:
+            try: giorno = int(g_txt)
+            except ValueError: giorno = 0
+            if not 1 <= giorno <= 31: return self._avviso("Il giorno di scadenza deve essere tra 1 e 31 (oppure lascialo vuoto).")
+        with get_conn() as conn:
+            nuove = genera_righe_ricorrenti(conn, ana, imp, datetime.strptime(d0, "%Y-%m-%d").date(), n_mesi, pattern, giorno, self.ent_note1.get().strip())
+        self._rows.extend(nuove)
+        self._refresh_grid()
+        self._lbl_info.config(text=f"Aggiunte {len(nuove)} righe")
+
+    def _genera_elenco(self):
+        d_doc = data_da_testo(self.de_doc.get())
+        scad = data_da_testo(self.de_scad.get())
+        pattern = self.ent_pat2.get().strip()
+        if not d_doc: return self._avviso("Indica una data documento valida (GG/MM/AAAA).")
+        if scad is None: return self._avviso("La data di scadenza non è valida (GG/MM/AAAA), oppure lasciala vuota.")
+        if not pattern: return self._avviso("Indica il numero documento (es. Busta paga {mm}/{aaaa}).")
+        voci, scartate = parse_elenco_incollato(self.txt.get("1.0", "end"))
+        if not voci:
+            return self._avviso("Nell'elenco non ho trovato nessuna riga valida.\nOgni riga deve avere un nome e un importo, es.:\nMario Rossi   1.250,00")
+        with get_conn() as conn:
+            nuove = genera_righe_elenco(conn, voci, datetime.strptime(d_doc, "%Y-%m-%d").date(), scad, pattern)
+        self._rows.extend(nuove)
+        self._refresh_grid()
+        self._lbl_info.config(text=f"Aggiunte {len(nuove)} righe" + (f" · {len(scartate)} scartate" if scartate else ""))
+        if scartate:
+            elenco = "\n".join("• " + s for s in scartate[:8]) + ("\n…" if len(scartate) > 8 else "")
+            self._avviso(f"{len(scartate)} righe dell'elenco non sono state riconosciute (manca il nome o l'importo non è valido):\n\n{elenco}")
+
+    # ── anteprima ──
+    @staticmethod
+    def _testo_cella(r, key):
+        if key in ("data_doc", "data_scad"): return fmt_date(r[key])
+        if key == "importo": return fmt_num(r[key])
+        return r[key]
+
+    def _refresh_grid(self):
+        self._close_editor()
+        for i in self.tree.get_children(): self.tree.delete(i)
+        tipo = self._tipo()
+        viste, ok, ko, tot = set(), 0, 0, 0.0
+        with get_conn() as conn:
+            c = conn.cursor()
+            for i, r in enumerate(self._rows):
+                err = controlla_riga_massiva(c, r, tipo, viste)
+                if err: ko += 1
+                else: ok += 1; tot += r["importo"]
+                vals = [self._testo_cella(r, k) for k in self.COLS[:-1]] + [("⚠ " + err + " (saltata)") if err else "✓"]
+                self.tree.insert("", "end", iid=str(i), values=vals, tags=("ko" if err else "ok",))
+        self._n_ok = ok
+        self._lbl_tot.config(text=f"{ok} documenti pronti  ·  Totale € {fmt_num(tot)}" + (f"  ·  {ko} da correggere (verrebbero saltati)" if ko else ""))
+        self.btn_crea.config(text=f"✅  Crea {ok} documenti", state="normal" if ok else "disabled")
+
+    def _close_editor(self):
+        if self._editor is not None:
+            e, self._editor = self._editor, None
+            e.destroy()
+
+    def _on_dblclick(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell": return
+        iid, col = self.tree.identify_row(event.y), self.tree.identify_column(event.x)
+        if not iid: return
+        key = self.COLS[int(col[1:]) - 1]
+        if key == "esito": return
+        bb = self.tree.bbox(iid, col)
+        if not bb: return
+        self._close_editor()
+        idx = int(iid)
+        ent = tk.Entry(self.tree, font=("Segoe UI", 9), relief="solid", bd=1)
+        ent.place(x=bb[0], y=bb[1], width=bb[2], height=bb[3])
+        ent.insert(0, self._testo_cella(self._rows[idx], key))
+        ent.select_range(0, tk.END); ent.focus_set()
+        ent.bind("<Return>", lambda e: self._commit_edit(idx, key, ent))
+        ent.bind("<FocusOut>", lambda e: self._commit_edit(idx, key, ent))
+        ent.bind("<Escape>", lambda e: self._close_editor())
+        self._editor = ent
+
+    def _commit_edit(self, idx, key, ent):
+        if self._editor is not ent: return
+        txt = ent.get().strip()
+        self._close_editor()
+        r = self._rows[idx]
+        if key in ("data_doc", "data_scad"):
+            iso = data_da_testo(txt)
+            if iso is None:
+                self._avviso("Data non valida: usa il formato GG/MM/AAAA."); return
+            r[key] = iso
+        elif key == "importo": r[key] = importo_da_testo(txt)
+        else: r[key] = txt
+        self._refresh_grid()
+
+    def _rimuovi(self):
+        for i in sorted((int(x) for x in self.tree.selection()), reverse=True): del self._rows[i]
+        self._refresh_grid()
+
+    def _svuota(self):
+        if self._rows and not messagebox.askyesno("Svuota anteprima", "Eliminare tutte le righe dell'anteprima?\n(Il database non viene toccato.)", parent=self): return
+        self._rows = []
+        self._lbl_info.config(text="")
+        self._refresh_grid()
+
+    # ── scrittura nel database ──
+    def _crea(self):
+        self._close_editor()
+        tipo, n = self._tipo(), self._n_ok
+        if n <= 0: return
+        tipo_doc, metodo = self.cmb_tipo_doc.get().strip(), self.cmb_metodo.get().strip()
+        reg = "PASSIVO (fornitori)" if tipo == "passivo" else "ATTIVO (clienti)"
+        if not messagebox.askyesno("Conferma creazione",
+                f"Creare {n} documenti nel registro {reg}?\n\n"
+                "Prima viene salvato un punto di ripristino: potrai annullare tutto con «Annulla ultima operazione».", parent=self): return
+        if not punto_di_ripristino(self, f"Inserimento massivo: {n} documenti ({tipo})"): return
+        nomi = {r["anagrafica"].strip() for r in self._rows}
+        etichetta = f"Inserimento massivo: {next(iter(nomi))}" if len(nomi) == 1 else f"Inserimento massivo: {len(nomi)} voci"
+        try:
+            ins, sal = inserisci_documenti_massivi(self._rows, tipo, tipo_doc, metodo, self._v_saldate.get(), self._v_rubrica.get(), etichetta)
+        except Exception as e:
+            messagebox.showerror("Errore", str(e), parent=self); return
+        messagebox.showinfo("Fatto", f"Creati {ins} documenti." + (f"\nSaltati: {sal}" if sal else ""), parent=self)
+        if self._on_done: self._on_done()
+        self.destroy()
 
 class ExportMassivoDialog(tk.Toplevel):
     def __init__(self, master, on_confirm):
@@ -838,6 +1483,7 @@ class App(tk.Tk):
         self._dash_filtro_globale = tk.BooleanVar(value=False)
 
         self._build_sidebar()
+        self.bind_all("<Control-z>", lambda e: self._annulla_ultima())
         
         self.main_container = tk.Frame(self, bg=C["bg"])
         self.main_container.pack(side="left", fill="both", expand=True)
@@ -900,6 +1546,10 @@ class App(tk.Tk):
         
         tk.Button(sb, text="🏢   Rubrica Aziende", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: AziendeWindow(self)).pack(fill="x", padx=8)
         tk.Button(sb, text="📥   Import Gestionale", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: ImportWindow(self, self._refresh_current_view)).pack(fill="x", padx=8)
+        tk.Button(sb, text="🔁   Inserimento massivo", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: InserimentoMassivoWindow(self, self._refresh_current_view)).pack(fill="x", padx=8)
+        tk.Button(sb, text="↩️   Annulla ultima operazione", font=("Segoe UI", 9, "bold"), bg=C["text"], fg=C["accent"], anchor="w", relief="flat", padx=20, pady=6, command=self._annulla_ultima).pack(fill="x", padx=8)
+        tk.Button(sb, text="🕘   Cronologia / Torna indietro", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: CronologiaWindow(self, self._dopo_ripristino)).pack(fill="x", padx=8)
+        tk.Button(sb, text="🧹   Pulisci importazioni", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: PulisciImportazioniWindow(self, self._refresh_current_view)).pack(fill="x", padx=8)
         tk.Button(sb, text="⚙️   Impostazioni", font=("Segoe UI", 9), bg=C["text"], fg="#dcd1c4", anchor="w", relief="flat", padx=20, pady=6, command=lambda: ConfigImpostazioniWindow(self, on_close_callback=self._refresh_current_view)).pack(fill="x", padx=8)
 
         spacer = tk.Frame(sb, bg=C["text"])
@@ -1234,6 +1884,7 @@ class App(tk.Tk):
         anno = self._corr_anno.get()
         mese = self._corr_mese.get()
         _, max_giorni = calendar.monthrange(anno, mese)
+        if not punto_di_ripristino(self, f"Corrispettivi {mese:02d}/{anno} salvati"): return
         
         with get_conn() as conn:
             c = conn.cursor()
@@ -1455,6 +2106,25 @@ class App(tk.Tk):
             for b in (self.btn_f_scaduto, self.btn_f_urgente, self.btn_f_aperti, self.btn_f_ok): b.config(relief="solid", borderwidth=1)
             self.btn_f_tutti.config(relief="sunken", borderwidth=2)
             self._load_data()
+
+    def _dopo_ripristino(self):
+        self._refresh_current_view()
+
+    def _annulla_ultima(self):
+        try:
+            if isinstance(self.focus_get(), (tk.Entry, ttk.Entry, ttk.Combobox)): return  # lascia a Ctrl+Z dei campi di testo
+        except Exception: pass
+        ultima = next((x for x in elenco_snapshot() if x[3] == "op"), None)
+        if not ultima:
+            messagebox.showinfo("Annulla", "Non ci sono operazioni da annullare."); return
+        p, dt, label, _ = ultima
+        if not messagebox.askyesno("Annulla ultima operazione",
+                f"Annullare:\n\n«{label}»\n({dt.strftime('%d/%m/%Y %H:%M')})\n\n"
+                "Il database torna a com'era prima. Potrai rifarla da «Cronologia / Torna indietro»."): return
+        try: ripristina_snapshot(p)
+        except Exception as e:
+            messagebox.showerror("Errore", str(e)); return
+        self._dopo_ripristino()
 
     def _refresh_current_view(self):
         if self._view == "dashboard": self._load_dashboard()
@@ -1734,6 +2404,7 @@ class App(tk.Tk):
     def _delete_invoice(self):
         f = self._get_selected_invoice(self.tree)
         if f and messagebox.askyesno("Conferma", "Eliminare la riga selezionata?"):
+            if not punto_di_ripristino(self, f"Eliminato documento {f[2]} - {f[3]}"): return
             with get_conn() as conn: conn.execute("DELETE FROM pagamenti WHERE fattura_id=?", (f[0],)); conn.execute("DELETE FROM fatture WHERE id=?", (f[0],))
             self._load_data()
 if __name__ == "__main__":
